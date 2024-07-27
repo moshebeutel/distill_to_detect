@@ -34,6 +34,7 @@ def get_student(args):
     logging.info(f'Loading student model {args.student}')
     renet_ctor = resnet18 if args.student == resnet18 else resnet50
     student_model = renet_ctor(weights=None)  # or resnet50
+    # student_model.load_state_dict(torch.load(f'{args.load_path}/resnet_distilled_from_clip_on_StanfordCars_best.pt'))
     num_of_params = sum([torch.numel(l) for l in student_model.parameters()])
     logging.info(f'Loaded student model num_of_params {num_of_params}')
     return student_model
@@ -149,6 +150,8 @@ def distill(args):
     student = get_student(args)
     student.fc = nn.Linear(student.fc.in_features, teacher.visual.output_dim)
     student = student.to(device)
+    student.load_state_dict(torch.load(f'{args.load_path}/resnet_distilled_from_clip_on_StanfordCars_best.pt'))
+
     benchmark = get_resnet(args)
     
     train_set, validation_set, test_set, classes = get_data(args)
@@ -168,59 +171,85 @@ def distill(args):
     accuracy_list_on_original, accuracy_list_on_ood = [], []
     benchmark_accuracy_list_on_original, benchmark_accuracy_list_on_ood = [], []
 
-    criterion = nn.MSELoss()
-    optimizer = torch.optim.Adam(student.parameters(), lr=0.0001)
+    # criterion = nn.CosineEmbeddingLoss()
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(student.parameters(), lr=args.lr)
     benchmark_optimizer = torch.optim.Adam(benchmark.parameters(), lr=0.001)
     benchmark_criterion = nn.CrossEntropyLoss()
 
-    num_epochs = 10
+    num_epochs = 100
+    T=2.0
+    soft_target_loss_weight = 0.1
+    ce_loss_weight = 1.0 - soft_target_loss_weight
+    teacher.eval()
 
     for epoch in range(num_epochs):
         student.train()  # Set student model to training mode
         benchmark.train()
         running_loss = 0.0
         logging.info(f'Epoch {epoch}/{num_epochs}')
-        
-        for images, labels , _ in tqdm(train_loader):
+        pbar = tqdm(train_loader)
+        total = 0
+        for images, labels , _ in pbar:
             images = images.to(device).float()
             labels = labels.to(device)
+            batch_size = labels.shape[0]
+            total += batch_size
             optimizer.zero_grad()
             benchmark_optimizer.zero_grad()
             # Get teacher model (CLIP) output
             with torch.no_grad():
-                teacher_outputs = teacher.encode_image(images)
+                teacher_logits = teacher.encode_image(images)
 
-            # Get student model output
-            student_outputs = student(images)
+
+            
+            # Forward pass with the student model
+            student_logits = student(images)
+
+            #Soften the student logits by applying softmax first and log() second
+            soft_targets = nn.functional.softmax(teacher_logits / T, dim=-1)
+            soft_prob = nn.functional.log_softmax(student_logits / T, dim=-1)
+
+            # Calculate the soft targets loss. Scaled by T**2 as suggested by the authors of the paper "Distilling the knowledge in a neural network"
+            soft_targets_loss = torch.sum(soft_targets * (soft_targets.log() - soft_prob)) / soft_prob.size()[0] * (T**2)
+
+            # Calculate the true label loss
+            label_loss = criterion(student_logits, labels)
+
+            # Weighted sum of the two losses
+            loss = soft_target_loss_weight * soft_targets_loss + ce_loss_weight * label_loss
+
             benchmark_outputs = benchmark(images)
+            benchmark_loss = benchmark_criterion(benchmark_outputs, labels)
 
-            # Compute loss
-            loss = criterion(student_outputs, teacher_outputs.float())
+            # backprop
             loss.backward()
             optimizer.step()
 
-            benchmark_loss = benchmark_criterion(benchmark_outputs, labels)
+            
             benchmark_loss.backward()
             benchmark_optimizer.step()
 
-            running_loss += loss.item()
+            running_loss += loss.item() 
 
-        # Evaluate again after a single epoch on standard data
-        val_acc_standard = evaluate(validation_loader, student, device)
-        accuracy_list_on_original.append(val_acc_standard)
-        logging.info(f'*** Validation after {epoch + 1} epochs of fine tune regular data ***')
-        logging.info(f'             Student Validation accuracy {val_acc_standard}')
-        benchmark_val_acc_standard = evaluate(validation_loader, benchmark, device)
-        benchmark_accuracy_list_on_original.append(benchmark_val_acc_standard)
-        logging.info(f'             Benchmark Validation accuracy {benchmark_val_acc_standard}')
-        val_acc_ood = evaluate(validation_loader_ood, student, device)
-        accuracy_list_on_ood.append(val_acc_ood)
-        logging.info(f'             Student Validation accuracy OOD {val_acc_ood}')
-        benchmark_val_acc_ood = evaluate(validation_loader_ood, benchmark, device)
-        benchmark_accuracy_list_on_ood.append(benchmark_val_acc_ood)
-        logging.info(f'             Benchmark Validation accuracy OOD {benchmark_val_acc_ood}')
-        
-        save_model(args, student, f'val_acc_standard_{val_acc_standard:.3f}_val_acc_ood_{val_acc_ood:.3f}')
+            pbar.set_postfix({"running_loss": running_loss / float(batch_size)})
+        if (epoch + 1) % args.eval_every == 0: 
+          # Evaluate again after a single epoch on standard data
+          val_acc_standard = evaluate(validation_loader, student, device)
+          accuracy_list_on_original.append(val_acc_standard)
+          logging.info(f'*** Validation after {epoch + 1} epochs of fine tune regular data ***')
+          logging.info(f'             Student Validation accuracy {val_acc_standard}')
+          benchmark_val_acc_standard = evaluate(validation_loader, benchmark, device)
+          benchmark_accuracy_list_on_original.append(benchmark_val_acc_standard)
+          logging.info(f'             Benchmark Validation accuracy {benchmark_val_acc_standard}')
+          val_acc_ood = evaluate(validation_loader_ood, student, device)
+          accuracy_list_on_ood.append(val_acc_ood)
+          logging.info(f'             Student Validation accuracy OOD {val_acc_ood}')
+          benchmark_val_acc_ood = evaluate(validation_loader_ood, benchmark, device)
+          benchmark_accuracy_list_on_ood.append(benchmark_val_acc_ood)
+          logging.info(f'             Benchmark Validation accuracy OOD {benchmark_val_acc_ood}')
+          
+          save_model(args, student, f'val_acc_standard_{val_acc_standard:.3f}_val_acc_ood_{val_acc_ood:.3f}')
 
         print(f"Epoch [{epoch + 1}/{num_epochs}], Loss: {running_loss / len(train_loader):.4f}")
 
@@ -293,6 +322,9 @@ if __name__ == '__main__':
                         help="resnet18 or resnet50")
 
     parser.add_argument("--use-cuda", type=bool, default=True, help="use cuda or cpu")
+    parser.add_argument("--eval-every", type=int, default=10)
+
+    
 
     args = parser.parse_args()
 
