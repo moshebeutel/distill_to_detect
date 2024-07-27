@@ -12,21 +12,28 @@ import torchvision.datasets
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
-from torchvision.models import resnet18
+from torchvision.models import resnet18, resnet50
 from tqdm import tqdm
 import gc
 
 def get_teacher(args):
     logging.info(f'Loading model {args.teacher}')
     model, preprocess = clip.load(args.teacher, device=get_device(args), jit=False)
-    model.load_state_dict(torch.load('/home/user1/saved_models/clip/clip_finetuned_to_StanfordCars_Fri Jul 26 14:31:50 2024_val_acc_standard_71.700_val_acc_ood_66.544.pt'))
+    model.load_state_dict(torch.load(f'{args.load_path}/clip_finetuned_to_StanfordCars_best.pt'))
     num_of_params = sum([torch.numel(l) for l in model.parameters()])
     logging.info(f'Loaded model num_of_params {num_of_params}')
     return model, preprocess
 
+def get_resnet(args):
+    logging.info(f'Loading benchmark model {args.resnet_ver}')
+    renet_ctor = resnet18 if args.resnet_ver == resnet18 else resnet50
+    model = renet_ctor(weights='DEFAULT')
+    return model
+
 def get_student(args):
     logging.info(f'Loading student model {args.student}')
-    student_model = resnet18(pretrained=False)  # or resnet50
+    renet_ctor = resnet18 if args.student == resnet18 else resnet50
+    student_model = renet_ctor(weights=None)  # or resnet50
     num_of_params = sum([torch.numel(l) for l in student_model.parameters()])
     logging.info(f'Loaded student model num_of_params {num_of_params}')
     return student_model
@@ -51,7 +58,7 @@ def get_data(args) -> tuple[Dataset, Dataset, Dataset, list[str]]:
     test_set = torchvision.datasets.ImageFolder(root=f'{args.data_path}/test')
     # classes = ['airplane', 'automobile', 'bird', 'cat', 'deer', 'dog', 'frog', 'horse', 'ship', 'truck']
 
-    with open('/home/user1/datasets/StanfordCars/names.csv', 'r') as f:
+    with open(f'{args.data_path}/names.csv', 'r') as f:
         reader = csv.reader(f)
         classes = [row[0] for row in reader]
     logging.info(f'Classes {classes}')
@@ -129,13 +136,24 @@ def evaluate(loader: DataLoader, model: torch.nn.Module, device: torch.device) -
     eval_accuracy = float((y_true == y_pred).sum().item()) / float(running_samples)
     return eval_accuracy * 100.0
 
+def save_model(args, model, suff):
+    save_path = Path(args.save_path)
+    if not save_path.exists():
+        save_path.mkdir()
+    file_path = Path(args.save_path) / f'resnet_distilled_from_clip_on_{args.data_name}_{time.asctime()}_{suff}.pt'
+    torch.save(model.state_dict(), file_path.as_posix())
+
 def distill(args):
     device = get_device(args)
     teacher, preprocess = get_teacher(args)
     student = get_student(args)
     student.fc = nn.Linear(student.fc.in_features, teacher.visual.output_dim)
     student = student.to(device)
+    benchmark = get_resnet(args)
+    
     train_set, validation_set, test_set, classes = get_data(args)
+    benchmark.fc = nn.Linear(benchmark.fc.in_features, len(classes))
+    benchmark = benchmark.to(device)
 
     train_set_original = ImageTitleDatasetWrapper(train_set, classes, preprocess)
     train_set_ood = ImageTitleDatasetWrapper(train_set, classes, preprocess, ood=True)
@@ -148,47 +166,84 @@ def distill(args):
     validation_loader_ood = DataLoader(validation_set_ood, batch_size=512, shuffle=False)
 
     accuracy_list_on_original, accuracy_list_on_ood = [], []
+    benchmark_accuracy_list_on_original, benchmark_accuracy_list_on_ood = [], []
 
     criterion = nn.MSELoss()
-    optimizer = torch.optim.Adam(student.parameters(), lr=0.001)
+    optimizer = torch.optim.Adam(student.parameters(), lr=0.0001)
+    benchmark_optimizer = torch.optim.Adam(benchmark.parameters(), lr=0.001)
+    benchmark_criterion = nn.CrossEntropyLoss()
 
     num_epochs = 10
 
     for epoch in range(num_epochs):
         student.train()  # Set student model to training mode
+        benchmark.train()
         running_loss = 0.0
-
-        for images, _ , _ in train_loader:
+        logging.info(f'Epoch {epoch}/{num_epochs}')
+        
+        for images, labels , _ in tqdm(train_loader):
             images = images.to(device).float()
+            labels = labels.to(device)
             optimizer.zero_grad()
-
+            benchmark_optimizer.zero_grad()
             # Get teacher model (CLIP) output
             with torch.no_grad():
                 teacher_outputs = teacher.encode_image(images)
 
             # Get student model output
             student_outputs = student(images)
+            benchmark_outputs = benchmark(images)
 
             # Compute loss
             loss = criterion(student_outputs, teacher_outputs.float())
             loss.backward()
             optimizer.step()
 
+            benchmark_loss = benchmark_criterion(benchmark_outputs, labels)
+            benchmark_loss.backward()
+            benchmark_optimizer.step()
+
             running_loss += loss.item()
 
-            # Evaluate again after a single epoch on standard data
-            val_acc_standard = evaluate(validation_loader, student, device)
-            accuracy_list_on_original.append(val_acc_standard)
-            logging.info(f'*** Validation after {epoch + 1} epochs of fine tune regular data ***')
-            logging.info(f'             Validation accuracy {val_acc_standard}')
-            val_acc_ood = evaluate(validation_loader_ood, student, device)
-            accuracy_list_on_ood.append(val_acc_ood)
-            logging.info(f'             Validation accuracy OOD {val_acc_ood}')
+        # Evaluate again after a single epoch on standard data
+        val_acc_standard = evaluate(validation_loader, student, device)
+        accuracy_list_on_original.append(val_acc_standard)
+        logging.info(f'*** Validation after {epoch + 1} epochs of fine tune regular data ***')
+        logging.info(f'             Student Validation accuracy {val_acc_standard}')
+        benchmark_val_acc_standard = evaluate(validation_loader, benchmark, device)
+        benchmark_accuracy_list_on_original.append(benchmark_val_acc_standard)
+        logging.info(f'             Benchmark Validation accuracy {benchmark_val_acc_standard}')
+        val_acc_ood = evaluate(validation_loader_ood, student, device)
+        accuracy_list_on_ood.append(val_acc_ood)
+        logging.info(f'             Student Validation accuracy OOD {val_acc_ood}')
+        benchmark_val_acc_ood = evaluate(validation_loader_ood, benchmark, device)
+        benchmark_accuracy_list_on_ood.append(benchmark_val_acc_ood)
+        logging.info(f'             Benchmark Validation accuracy OOD {benchmark_val_acc_ood}')
+        
+        save_model(args, student, f'val_acc_standard_{val_acc_standard:.3f}_val_acc_ood_{val_acc_ood:.3f}')
 
         print(f"Epoch [{epoch + 1}/{num_epochs}], Loss: {running_loss / len(train_loader):.4f}")
 
     print("Training completed.")
 
+def set_seed(seed, cudnn_enabled=True):
+    """for reproducibility
+
+    :param seed:
+    :return:
+    """
+
+    np.random.seed(seed)
+    random.seed(seed)
+
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+    torch.backends.cudnn.enabled = cudnn_enabled
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
 
 
 def set_logger():
@@ -216,7 +271,7 @@ if __name__ == '__main__':
     ##################################
 
     parser.add_argument("--teacher", type=str, default=model_name)
-    parser.add_argument("--student", type=str, default='resnet18')
+    parser.add_argument("--student", type=str, default='resnet50')
     # parser.add_argument("--num-blocks", type=int, default=3)
     # parser.add_argument("--block-size", type=int, default=3)
 
@@ -229,16 +284,21 @@ if __name__ == '__main__':
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-2, help="learning rate")
     parser.add_argument("--wd", type=float, default=1e-4, help="weight decay")
+    parser.add_argument("--seed", type=int, default=42, help="seed value")
+    parser.add_argument("--save-path", type=str, default=(Path.home() / f'saved_models' / 'clip').as_posix(),
+                        help="dir path for checkpoints")
+    parser.add_argument("--load-path", type=str, default='',
+                        help="dir path for checkpoints")
+    parser.add_argument("--resnet-ver", type=str, default='resnet50', choices=['resnet18', 'resnet50'],
+                        help="resnet18 or resnet50")
 
     parser.add_argument("--use-cuda", type=bool, default=True, help="use cuda or cpu")
 
     args = parser.parse_args()
 
     set_logger()
-    # set_seed(args.seed)
+    set_seed(args.seed)
 
-    exp_name = f'Distillation_{args.teacher}_to_{args.student}_' \
-               f'optimizer_{args.optimizer}_batch_size_{args.batch_size}' \
-               f'_lr_{args.lr}_wd_{args.wd}'
+   
 
     distill(args)

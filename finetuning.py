@@ -72,6 +72,9 @@ def save_model(args, model, suff):
 def get_model(args):
     logging.info(f'Loading model {args.model}')
     model, preprocess = clip.load(args.model, device=get_device(args), jit=False)
+    if(args.load_path):
+          model.load_state_dict(torch.load(f'{args.load_path}/clip_finetuned_to_StanfordCars.pt'))
+
     num_of_params = sum([torch.numel(l) for l in model.parameters()])
     logging.info(f'Loaded model num_of_params {num_of_params}')
     return model, preprocess
@@ -98,7 +101,7 @@ def get_data(args) -> tuple[Dataset, Dataset, Dataset, list[str]]:
     test_set = torchvision.datasets.ImageFolder(root=f'{args.data_path}/test')
     # classes = ['airplane', 'automobile', 'bird', 'cat', 'deer', 'dog', 'frog', 'horse', 'ship', 'truck']
 
-    with open('/home/user1/datasets/StanfordCars/names.csv', 'r') as f:
+    with open(f'{args.data_path}/names.csv', 'r') as f:
         reader = csv.reader(f)
         classes = [row[0] for row in reader]
     logging.info(f'Classes {classes}')
@@ -346,11 +349,13 @@ if __name__ == '__main__':
     parser.add_argument("--exp-name", type=str, default='', help="suffix for exp name")
     parser.add_argument("--save-path", type=str, default=(Path.home() / f'saved_models' / 'clip').as_posix(),
                         help="dir path for checkpoints")
+    parser.add_argument("--load-path", type=str, default='',
+                        help="dir path for checkpoints")
     parser.add_argument("--seed", type=int, default=42, help="seed value")
 
     parser.add_argument("--use-cuda", type=bool, default=True, help="use cuda or cpu")
 
-    parser.add_argument("--finetune-on-ood", type=bool, default=True, help="preform fine tune on ood data")
+    parser.add_argument("--finetune-on-ood", type=bool, default=False, help="preform fine tune on ood data")
     parser.add_argument("--finetune-epochs", type=int, default=10, help="num epochs of fine tune")
     parser.add_argument("--finetune-ood-epochs", type=int, default=3, help="num epochs of fine tune")
 
@@ -359,8 +364,6 @@ if __name__ == '__main__':
     set_logger()
     set_seed(args.seed)
 
-    args['exp-name'] = f'finetune_{args.model}_to_dataset_{args.data_name}_' \
-                       f'optimizer_{args.optimizer}_batch_size_{args.batch_size}' \
-                       f'_lr_{args.lr}_wd_{args.wd}'
+    
 
     finetune(args)
