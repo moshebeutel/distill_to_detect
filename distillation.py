@@ -7,10 +7,11 @@ import clip
 import numpy as np
 import torch
 from torch import nn
+from torch.nn import functional as F
 from torch.utils.data import DataLoader
 from torchvision.models import resnet18, resnet50
 from tqdm import tqdm
-from utils import set_seed, set_logger, get_device, get_data, ImageTitleDatasetWrapper
+from utils import set_seed, set_logger, get_device, get_data, ImageTitleDatasetWrapper, get_resnet
 
 
 def get_teacher(args):
@@ -22,13 +23,6 @@ def get_teacher(args):
     return model, preprocess
 
 
-def get_resnet(args):
-    logging.info(f'Loading benchmark model {args.resnet_ver}')
-    renet_ctor = resnet18 if args.resnet_ver == resnet18 else resnet50
-    model = renet_ctor(weights='DEFAULT')
-    return model
-
-
 def get_student(args):
     logging.info(f'Loading student model {args.student}')
     renet_ctor = resnet18 if args.student == resnet18 else resnet50
@@ -37,6 +31,7 @@ def get_student(args):
     num_of_params = sum([torch.numel(l) for l in student_model.parameters()])
     logging.info(f'Loaded student model num_of_params {num_of_params}')
     return student_model
+
 
 @torch.no_grad()
 def evaluate(loader: DataLoader, model: torch.nn.Module, device: torch.device) -> float:
@@ -84,6 +79,32 @@ def save_model(args, model, suff):
     torch.save(model.state_dict(), file_path.as_posix())
 
 
+def get_vision_language_alignment_loss(args, teacher_vision_output, teacher_language_output, student_output):
+    # Calculate outputs norm
+    student_outputs_norm = nn.functional.normalize(student_output, dim=-1)
+    teacher_vision_outputs_norm = nn.functional.normalize(teacher_vision_output, dim=-1)
+    teacher_language_outputs_norm = nn.functional.normalize(teacher_language_output, dim=-1)
+
+    # Calculate open-set classification output logits - text feature logits has 2 dims
+    student_outputs_for_align = torch.einsum('ni,ci->nc', student_outputs_norm, teacher_language_outputs_norm)
+    teacher_outputs_for_align = torch.einsum('ni,ci->nc', teacher_vision_outputs_norm, teacher_language_outputs_norm)
+
+    # Divide by distillation temperature
+    student_outputs_for_align = student_outputs_for_align / args.temperature
+    teacher_outputs_for_align = teacher_outputs_for_align / args.temperature
+
+    # Take top k teacher outputs and corresponding student outputs for alignment
+    teacher_for_align_topk_values, teacher_for_align_topk_ids = teacher_outputs_for_align.topk(
+        k=min(args.clip_align_proximal_text_num, teacher_outputs_for_align.shape[-1]), dim=-1)  # [N, K]
+    student_for_align_topk_values = student_outputs_for_align.gather(-1, teacher_for_align_topk_ids)  # [N, K]
+
+    soft_teacher_values = F.softmax(teacher_for_align_topk_values, dim=-1)
+    log_soft_teacher_values = F.log_softmax(teacher_for_align_topk_values, dim=-1)
+    soft_student_values = F.softmax(student_for_align_topk_values, dim=-1)
+
+    return 1.0 * (soft_teacher_values * log_soft_teacher_values - soft_student_values).sum(dim=-1).mean()
+
+
 def distill(args):
     device = get_device(args)
     teacher, preprocess = get_teacher(args)
@@ -99,12 +120,9 @@ def distill(args):
     benchmark = benchmark.to(device)
 
     train_set_original = ImageTitleDatasetWrapper(train_set, classes, preprocess)
-    train_set_ood = ImageTitleDatasetWrapper(train_set, classes, preprocess, ood=True)
     validation_set_original = ImageTitleDatasetWrapper(validation_set, classes, preprocess)
     validation_set_ood = ImageTitleDatasetWrapper(validation_set, classes, preprocess, ood=True)
-    test_set = ImageTitleDatasetWrapper(test_set, classes, preprocess)
     train_loader = DataLoader(train_set_original, batch_size=64, shuffle=True)
-    train_loader_ood = DataLoader(train_set_ood, batch_size=64, shuffle=True)
     validation_loader = DataLoader(validation_set_original, batch_size=512, shuffle=False)
     validation_loader_ood = DataLoader(validation_set_ood, batch_size=512, shuffle=False)
 
@@ -129,24 +147,24 @@ def distill(args):
         running_loss = 0.0
         logging.info(f'Epoch {epoch}/{num_epochs}')
         pbar = tqdm(train_loader)
-        total = 0
-        for images, labels, _ in pbar:
+        for images, labels, titles in pbar:
             images = images.to(device).float()
             labels = labels.to(device)
+            # titles = titles.to(device)
             batch_size = labels.shape[0]
-            total += batch_size
             optimizer.zero_grad()
             benchmark_optimizer.zero_grad()
             # Get teacher model (CLIP) output
             with torch.no_grad():
                 teacher_logits = teacher.encode_image(images)
+                # teacher_text_logits = teacher.encode_text(titles.squeeze())
 
             # Forward pass with the student model
             student_logits = student(images)
 
             # Soften the student logits by applying softmax first and log() second
-            soft_targets = nn.functional.softmax(teacher_logits / T, dim=-1)
-            soft_prob = nn.functional.log_softmax(student_logits / T, dim=-1)
+            soft_targets = F.softmax(teacher_logits / T, dim=-1)
+            soft_prob = F.log_softmax(student_logits / T, dim=-1)
 
             # Calculate the soft targets loss. Scaled by T**2 as suggested by the authors of the paper "Distilling
             # the knowledge in a neural network"
@@ -188,7 +206,8 @@ def distill(args):
             benchmark_accuracy_list_on_ood.append(benchmark_val_acc_ood)
             logging.info(f'             Benchmark Validation accuracy OOD {benchmark_val_acc_ood}')
 
-            save_model(args, student, f'val_acc_standard_{val_acc_standard:.3f}_val_acc_ood_{val_acc_ood:.3f}')
+            save_model(args, student, f'distilled_val_acc_standard_{val_acc_standard:.3f}_val_acc_ood_{val_acc_ood:.3f}')
+            save_model(args, benchmark, f'benchmark_val_acc_standard_{benchmark_val_acc_standard:.3f}_val_acc_ood_{benchmark_val_acc_ood:.3f}')
 
         print(f"Epoch [{epoch + 1}/{num_epochs}], Loss: {running_loss / len(train_loader):.4f}")
 
@@ -239,10 +258,10 @@ if __name__ == '__main__':
     parser.add_argument("--eval-every", type=int, default=10)
 
     parser.add_argument("--temperature", type=float, default=2.0, help="Distillation loss temperature")
-    parser.add_argument("--distillation-loss-weight", type=float, default=0.01, help="Distillation loss weight")
+    parser.add_argument("--distillation-loss-weight", type=float, default=0.02, help="Distillation loss weight")
 
-
-
+    parser.add_argument('--clip-align-proximal-text-num', type=int, default=256,
+                        help="If >0, specifies the k in L-vlalign")
 
     args = parser.parse_args()
 

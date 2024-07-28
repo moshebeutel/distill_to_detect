@@ -7,6 +7,7 @@ import torch
 import torchvision.datasets
 from torch.utils.data import Dataset
 from torchvision import transforms
+from torchvision.models import resnet18, resnet50
 
 
 def set_seed(seed, cudnn_enabled=True):
@@ -95,3 +96,10 @@ class ImageTitleDatasetWrapper(Dataset):
         image = self._preprocess(image)
         title = self.tokenized_title_list[label]
         return image, label, title
+
+
+def get_resnet(args):
+    logging.info(f'Loading resnet model {args.resnet_ver}')
+    renet_ctor = resnet18 if args.resnet_ver == resnet18 else resnet50
+    model = renet_ctor(weights='DEFAULT')
+    return model
