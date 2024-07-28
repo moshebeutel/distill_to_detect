@@ -1,19 +1,17 @@
 import argparse
-import csv
 import logging
 import time
 from functools import partial
 from pathlib import Path
-import random
 import clip
 import numpy as np
 import torch
-import torchvision.datasets
 from torch import nn
-from torch.utils.data import DataLoader, Dataset
-from torchvision import transforms
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 import gc
+
+from utils import set_logger, set_seed, get_device, get_data, ImageTitleDatasetWrapper
 
 
 def save_iteration_results(accuracy_list_on_ood_data: list[float], accuracy_list_on_standard_data: list[float]):
@@ -34,33 +32,6 @@ def save_iteration_results(accuracy_list_on_ood_data: list[float], accuracy_list
         np.save(f, np.array(accuracy_list_on_standard_data))
 
 
-def set_seed(seed, cudnn_enabled=True):
-    """for reproducibility
-
-    :param seed:
-    :return:
-    """
-
-    np.random.seed(seed)
-    random.seed(seed)
-
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-
-    torch.backends.cudnn.enabled = cudnn_enabled
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.deterministic = True
-
-
-def set_logger():
-    logging.basicConfig(
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        level=logging.INFO
-    )
-
-
 def save_model(args, model, suff):
     save_path = Path(args.save_path)
     if not save_path.exists():
@@ -72,93 +43,12 @@ def save_model(args, model, suff):
 def get_model(args):
     logging.info(f'Loading model {args.model}')
     model, preprocess = clip.load(args.model, device=get_device(args), jit=False)
-    if(args.load_path):
-          model.load_state_dict(torch.load(f'{args.load_path}/clip_finetuned_to_StanfordCars.pt'))
+    if args.load_path:
+        model.load_state_dict(torch.load(f'{args.load_path}/best_model.pt'))
 
     num_of_params = sum([torch.numel(l) for l in model.parameters()])
     logging.info(f'Loaded model num_of_params {num_of_params}')
     return model, preprocess
-
-
-def train_val_split(train_set: Dataset, split_ratio: float = 0.8, shuffle: bool = True) -> tuple[Dataset, Dataset]:
-    from torch.utils.data import DataLoader, Subset
-    dataset_size = len(train_set)
-    split_index = int(dataset_size * split_ratio)
-    indices = list(range(dataset_size))
-    if shuffle:
-        random.shuffle(indices)
-    # Create Subset objects for the training and validation sets
-    train_subset = Subset(train_set, indices[:split_index])
-    validation_subset = Subset(train_set, indices[split_index:])
-    return train_subset, validation_subset
-
-
-def get_data(args) -> tuple[Dataset, Dataset, Dataset, list[str]]:
-    # train_set = CIFAR10(root, train=True, download=True)
-    train_set = torchvision.datasets.ImageFolder(root=f'{args.data_path}/train')
-    train_set, validation_set = train_val_split(train_set)
-    # test_set = CIFAR10(root, train=False, download=True)
-    test_set = torchvision.datasets.ImageFolder(root=f'{args.data_path}/test')
-    # classes = ['airplane', 'automobile', 'bird', 'cat', 'deer', 'dog', 'frog', 'horse', 'ship', 'truck']
-
-    with open(f'{args.data_path}/names.csv', 'r') as f:
-        reader = csv.reader(f)
-        classes = [row[0] for row in reader]
-    logging.info(f'Classes {classes}')
-    return train_set, validation_set, test_set, classes
-
-
-def get_device(args):
-    device = torch.device(
-        "cuda:0" if torch.cuda.is_available() and args.use_cuda else "cpu"
-    )
-    logging.info(f'Use device: {device}')
-    return device
-
-
-class ImageTitleDatasetWrapper(Dataset):
-    def __init__(self, dataset: Dataset, list_txt: list[str], preprocess, ood=False):
-        # Initialize image paths and corresponding texts
-        self._dataset = dataset
-
-        self.tokenized_title_dict = {c: clip.tokenize(f"a photo of a {c}") for c in list_txt}
-        self.tokenized_title_list = [clip.tokenize(f"a photo of a {c}") for c in list_txt]
-        self._transform = transforms.Compose([transforms.ToTensor(),
-                                              transforms.ColorJitter(contrast=0.5, brightness=1.0),
-                                              transforms.ToPILImage()])
-        # Load the model
-        self._preprocess = preprocess
-        self._ood = ood
-
-    def __len__(self):
-        return len(self._dataset)
-
-    def __getitem__(self, idx, ood=False):
-        image, label = self._dataset[idx]
-        image = self._transform(image) if self._ood else image
-        image = self._preprocess(image)
-        title = self.tokenized_title_list[label]
-        return image, label, title
-
-
-def convert_models_to_fp32(model):
-    for p in model.parameters():
-        p.data = p.data.float()
-        if p.grad is not None:
-            p.grad.data = p.grad.data.float()
-
-
-def convert_models_to_mix(model):
-    clip.model.convert_weights(model)
-
-
-def freeze_embed(model):
-    freeze_list: list[str] = ['positional_embedding', 'text_projection', 'logit_scale',
-                              'visual.class_embedding',
-                              'visual.positional_embedding', 'visual.proj', 'visual.conv1.weight',
-                              'visual.ln_pre.weight', 'visual.ln_pre.bias']
-    for n, p in model.named_parameters():
-        p.requires_grad = n not in freeze_list
 
 
 @torch.no_grad()
@@ -195,6 +85,26 @@ def evaluate(loader: DataLoader, model: torch.nn.Module, device: torch.device) -
         torch.cuda.empty_cache()
     gc.collect()
     return accuracy
+
+
+def convert_models_to_fp32(model):
+    for p in model.parameters():
+        p.data = p.data.float()
+        if p.grad is not None:
+            p.grad.data = p.grad.data.float()
+
+
+def convert_models_to_mix(model):
+    clip.model.convert_weights(model)
+
+
+def freeze_embed(model):
+    freeze_list: list[str] = ['positional_embedding', 'text_projection', 'logit_scale',
+                              'visual.class_embedding',
+                              'visual.positional_embedding', 'visual.proj', 'visual.conv1.weight',
+                              'visual.ln_pre.weight', 'visual.ln_pre.bias']
+    for n, p in model.named_parameters():
+        p.requires_grad = n not in freeze_list
 
 
 def train_iteration(batch, device, loss_img, loss_txt, model, optimizer):
@@ -349,7 +259,7 @@ if __name__ == '__main__':
     parser.add_argument("--exp-name", type=str, default='', help="suffix for exp name")
     parser.add_argument("--save-path", type=str, default=(Path.home() / f'saved_models' / 'clip').as_posix(),
                         help="dir path for checkpoints")
-    parser.add_argument("--load-path", type=str, default='',
+    parser.add_argument("--load-path", type=str, default=(Path.home() / f'saved_models' / 'clip').as_posix(),
                         help="dir path for checkpoints")
     parser.add_argument("--seed", type=int, default=42, help="seed value")
 
@@ -363,7 +273,5 @@ if __name__ == '__main__':
 
     set_logger()
     set_seed(args.seed)
-
-    
 
     finetune(args)
