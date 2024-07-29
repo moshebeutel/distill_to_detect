@@ -1,6 +1,9 @@
 import csv
 import logging
 import random
+import time
+from pathlib import Path
+
 import clip
 import numpy as np
 import torch
@@ -8,6 +11,7 @@ import torchvision.datasets
 from torch.utils.data import Dataset
 from torchvision import transforms
 from torchvision.models import resnet18, resnet50
+from torchvision.transforms import v2
 
 
 def set_seed(seed, cudnn_enabled=True):
@@ -74,25 +78,29 @@ def train_val_split(train_set: Dataset, split_ratio: float = 0.8, shuffle: bool 
 
 
 class ImageTitleDatasetWrapper(Dataset):
-    def __init__(self, dataset: Dataset, list_txt: list[str], preprocess, ood=False):
+    def __init__(self, dataset: Dataset, list_txt: list[str], preprocess, ood=False, severity=1):
         # Initialize image paths and corresponding texts
         self._dataset = dataset
 
         self.tokenized_title_dict = {c: clip.tokenize(f"a photo of a {c}") for c in list_txt}
         self.tokenized_title_list = [clip.tokenize(f"a photo of a {c}") for c in list_txt]
-        self._transform = transforms.Compose([transforms.ToTensor(),
-                                              transforms.ColorJitter(contrast=0.5, brightness=1.0),
-                                              transforms.ToPILImage()])
         # Load the model
         self._preprocess = preprocess
         self._ood = ood
+
+        noise_scale = [0.04, 0.06, .08, .09, .10][severity - 1]
+        self._transform_ood = v2.Compose([v2.ToImage(),
+                                          v2.ToDtype(torch.float32, scale=True),
+                                          v2.GaussianNoise(sigma=noise_scale, clip=True),
+                                          v2.ToDtype(torch.uint8, scale=True),
+                                          v2.ToPILImage()])
 
     def __len__(self):
         return len(self._dataset)
 
     def __getitem__(self, idx, ood=False):
         image, label = self._dataset[idx]
-        image = self._transform(image) if self._ood else image
+        image = self._transform_ood(image) if self._ood else image
         image = self._preprocess(image)
         title = self.tokenized_title_list[label]
         return image, label, title
@@ -103,3 +111,11 @@ def get_resnet(args):
     renet_ctor = resnet18 if args.resnet_ver == resnet18 else resnet50
     model = renet_ctor(weights='DEFAULT')
     return model
+
+
+def save_model(args, model, suff):
+    save_path = Path(args.save_path)
+    if not save_path.exists():
+        save_path.mkdir()
+    file_path = Path(args.save_path) / f'resnet_distilled_from_clip_on_{args.data_name}_{time.asctime()}_{suff}.pt'
+    torch.save(model.state_dict(), file_path.as_posix())

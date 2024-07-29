@@ -17,9 +17,7 @@ from PIL import Image
 from torchvision.transforms import v2
 from tqdm import tqdm
 
-from distillation import save_model
-from utils import set_logger, set_seed, get_device, get_resnet, get_data
-
+from utils import set_logger, set_seed, get_device, get_resnet, get_data, save_model
 
 IMAGE_SIZE = 224
 
@@ -107,7 +105,7 @@ class ImageTitleDetectionDatasetWrapper(Dataset):
 
         image = Image.open(img_path.as_posix()).convert('RGB')
 
-        if self._ood_transform:
+        if self._ood:
             image = self._ood_transform(image)
 
         if self._transform:
@@ -273,7 +271,7 @@ def detect(args):
             val_acc_standard, val_iou_standard = evaluate(validation_loader, distilled_detector, device)
             accuracy_list_on_original.append(val_acc_standard)
             iou_list_on_original.append(val_iou_standard)
-            logging.info(f'*** Validation after {epoch + 1} epochs of fine tune regular data ***')
+            logging.info(f'*** Validation after {epoch + 1} epochs detector train ***')
             logging.info(f'             Distilled Validation accuracy {val_acc_standard}')
             logging.info(f'             Distilled Validation iou {val_iou_standard}')
             benchmark_val_acc_standard, benchmark_val_iou_standard = evaluate(validation_loader, benchmark_detector,
@@ -294,9 +292,9 @@ def detect(args):
             logging.info(f'             Benchmark Validation iou OOD {benchmark_val_iou_ood}')
 
             save_model(args, distilled_detector,
-                       f'distilled_detector_val_acc_standard_{val_acc_standard:.3f}_val_acc_ood_{val_acc_ood:.3f}')
+                       f'distilled_classifier_val_acc_standard_{val_acc_standard:.3f}_val_acc_ood_{val_acc_ood:.3f}')
             save_model(args, benchmark_detector,
-                       f'benchmark_detector_val_acc_standard_{benchmark_val_acc_standard:.3f}_val_acc_ood_{benchmark_val_acc_ood:.3f}')
+                       f'benchmark_classifier_val_acc_standard_{benchmark_val_acc_standard:.3f}_val_acc_ood_{benchmark_val_acc_ood:.3f}')
 
         logging.info(f"Epoch [{epoch + 1}/{args.num_epochs}], Loss: {running_loss / len(train_loader):.4f}")
 

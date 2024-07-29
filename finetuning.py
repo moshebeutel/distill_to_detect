@@ -1,5 +1,7 @@
 import argparse
+import copy
 import logging
+import os
 import time
 from functools import partial
 from pathlib import Path
@@ -38,6 +40,7 @@ def save_model(args, model, suff):
         save_path.mkdir()
     file_path = Path(args.save_path) / f'clip_finetuned_to_{args.data_name}_{time.asctime()}_{suff}.pt'
     torch.save(model.state_dict(), file_path.as_posix())
+    return file_path
 
 
 def get_model(args):
@@ -110,14 +113,16 @@ def freeze_embed(model):
 def train_iteration(batch, device, loss_img, loss_txt, model, optimizer):
     freeze_embed(model)
     optimizer.zero_grad()
-    images, _, texts = batch
+    images, labels, texts = batch
     images = images.to(device)
     texts = texts.squeeze()
     texts = texts.to(device)
+    labels = labels.to(device)
     # Forward pass
     logits_per_image, logits_per_text = model(images, texts)
     # Compute loss
     ground_truth = torch.arange(len(images), dtype=torch.long, device=device)
+    # loss_cls = loss_img(logits_per_image, labels)
     total_loss = (loss_img(logits_per_image, ground_truth) + loss_txt(logits_per_text, ground_truth)) / 2
     # Backward pass
     total_loss.backward()
@@ -163,20 +168,33 @@ def finetune(args):
     train_set_ood = ImageTitleDatasetWrapper(train_set, classes, preprocess, ood=True)
     validation_set_original = ImageTitleDatasetWrapper(validation_set, classes, preprocess)
     validation_set_ood = ImageTitleDatasetWrapper(validation_set, classes, preprocess, ood=True)
-    test_set = ImageTitleDatasetWrapper(test_set, classes, preprocess)
+    validation_set_ood_severe = ImageTitleDatasetWrapper(validation_set, classes, preprocess, ood=True, severity=5)
     train_loader = DataLoader(train_set_original, batch_size=64, shuffle=True)
     train_loader_ood = DataLoader(train_set_ood, batch_size=64, shuffle=True)
     validation_loader = DataLoader(validation_set_original, batch_size=512, shuffle=False)
     validation_loader_ood = DataLoader(validation_set_ood, batch_size=512, shuffle=False)
+    validation_loader_ood_severe = DataLoader(validation_set_ood_severe, batch_size=512, shuffle=False)
+
+    test_set = ImageTitleDatasetWrapper(test_set, classes, preprocess)
+    test_set_ood = ImageTitleDatasetWrapper(test_set, classes, preprocess, ood=True)
+    test_set_ood_severe = ImageTitleDatasetWrapper(test_set, classes, preprocess, ood=True, severity=5)
+    test_loader = DataLoader(test_set, batch_size=512, shuffle=False)
+    test_loader_ood = DataLoader(test_set_ood, batch_size=512, shuffle=False)
+    test_loader_ood_severe = DataLoader(test_set_ood_severe, batch_size=512, shuffle=False)
+
 
     # Evaluate model - Baseline Accuracy
     model.eval()
+    best_val_acc_ood = 0.0
     val_acc_baseline = evaluate(validation_loader, model, device)
     logging.info(f'Baseline validation accuracy {val_acc_baseline}')
     val_acc_ood_baseline = evaluate(validation_loader_ood, model, device)
     logging.info(f'Baseline validation accuracy OOD {val_acc_ood_baseline}')
+    val_acc_ood_severe_baseline = evaluate(validation_loader_ood_severe, model, device)
+    logging.info(f'Baseline validation accuracy OOD {val_acc_ood_severe_baseline}')
 
-    accuracy_list_on_original, accuracy_list_on_ood = [val_acc_baseline], [val_acc_ood_baseline]
+
+    accuracy_list_on_original, accuracy_list_on_ood, accuracy_list_on_ood_severe = [val_acc_baseline], [val_acc_ood_baseline], [val_acc_ood_severe_baseline]
 
     # fine tuning on standard data
     for epoch in range(args.finetune_epochs):
@@ -186,17 +204,26 @@ def finetune(args):
         loss_txt = nn.CrossEntropyLoss()
         train_epoch(device, loss_img, loss_txt, 1, optimizer,
                     train_loader, {}, model, 0)
+        if (epoch + 1) % args.eval_every == 0:
+            # Evaluate again after a single epoch on standard data
+            val_acc_standard = evaluate(validation_loader, model, device)
+            accuracy_list_on_original.append(val_acc_standard)
+            logging.info(f'*** Validation after {epoch + 1} epochs of fine tune regular data ***')
+            logging.info(f'             Validation accuracy {val_acc_standard}')
+            val_acc_ood = evaluate(validation_loader_ood, model, device)
+            accuracy_list_on_ood.append(val_acc_ood)
+            logging.info(f'             Validation accuracy OOD {val_acc_ood}')
+            val_acc_ood_severe = evaluate(validation_loader_ood_severe, model, device)
+            accuracy_list_on_ood_severe.append(val_acc_ood_severe)
+            logging.info(f'             Validation accuracy OOD severe {val_acc_ood_severe}')
 
-        # Evaluate again after a single epoch on standard data
-        val_acc_standard = evaluate(validation_loader, model, device)
-        accuracy_list_on_original.append(val_acc_standard)
-        logging.info(f'*** Validation after {epoch + 1} epochs of fine tune regular data ***')
-        logging.info(f'             Validation accuracy {val_acc_standard}')
-        val_acc_ood = evaluate(validation_loader_ood, model, device)
-        accuracy_list_on_ood.append(val_acc_ood)
-        logging.info(f'             Validation accuracy OOD {val_acc_ood}')
-
-        save_model(args, model, f'val_acc_standard_{val_acc_standard:.3f}_val_acc_ood_{val_acc_ood:.3f}')
+            fp = save_model(args, model, f'val_acc_standard_{val_acc_standard:.3f}_val_acc_ood_{val_acc_ood:.3f}_val_acc_ood_severe{val_acc_ood_severe:.3f}')
+            if val_acc_ood > best_val_acc_ood:
+                best_val_acc_ood = val_acc_ood
+                symlink_path = fp.parent / 'best_model.pt'
+                if symlink_path.exists():
+                    symlink_path.unlink()
+                os.symlink(fp.as_posix(), symlink_path.as_posix())
 
     if args.finetune_on_ood:
         # Fine tune on OOD data and evaluate after each batch
@@ -212,6 +239,15 @@ def finetune(args):
         for epoch in range(num_epochs):
             epoch_loss = train_epoch_fn(model, epoch)
             logging.info(f'Epoch {epoch} loss {epoch_loss}')
+
+    test_acc_standard = evaluate(test_loader, model, device)
+    logging.info(f'*** Test Accuracy after fine tune regular data ***')
+    logging.info(f'             Test Accuracy {test_acc_standard}')
+    test_acc_ood = evaluate(test_loader_ood, model, device)
+
+    logging.info(f'             Test Accuracy OOD {test_acc_ood}')
+    test_acc_ood_severe = evaluate(test_loader_ood_severe, model, device)
+    logging.info(f'             Test Accuracy OOD severe {test_acc_ood_severe}')
 
     logging.info('Finished')
 
@@ -244,7 +280,7 @@ if __name__ == '__main__':
     ##################################
     #       Optimization args        #
     ##################################
-    parser.add_argument("--num-steps", type=int, default=30)
+    parser.add_argument("--num-steps", type=int, default=15)
     parser.add_argument("--optimizer", type=str, default='sgd',
                         choices=['adam', 'sgd'], help="optimizer type")
     parser.add_argument("--batch-size", type=int, default=64)
@@ -266,8 +302,10 @@ if __name__ == '__main__':
     parser.add_argument("--use-cuda", type=bool, default=True, help="use cuda or cpu")
 
     parser.add_argument("--finetune-on-ood", type=bool, default=False, help="preform fine tune on ood data")
-    parser.add_argument("--finetune-epochs", type=int, default=20, help="num epochs of fine tune")
+    parser.add_argument("--finetune-epochs", type=int, default=15, help="num epochs of fine tune")
     parser.add_argument("--finetune-ood-epochs", type=int, default=3, help="num epochs of fine tune")
+
+    parser.add_argument("--eval-every", type=int, default=5)
 
     args = parser.parse_args()
 

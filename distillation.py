@@ -1,17 +1,19 @@
 import argparse
+import csv
 import gc
 import logging
-import time
 from pathlib import Path
 import clip
 import numpy as np
 import torch
+import torchvision
 from torch import nn
 from torch.nn import functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from torchvision.models import resnet18, resnet50
 from tqdm import tqdm
-from utils import set_seed, set_logger, get_device, get_data, ImageTitleDatasetWrapper, get_resnet
+from utils import set_seed, set_logger, get_device, get_data, ImageTitleDatasetWrapper, get_resnet, train_val_split, \
+    save_model
 
 
 def get_teacher(args):
@@ -27,6 +29,7 @@ def get_student(args):
     logging.info(f'Loading student model {args.student}')
     renet_ctor = resnet18 if args.student == resnet18 else resnet50
     student_model = renet_ctor(weights='DEFAULT')  # or resnet50
+
     # student_model.load_state_dict(torch.load(f'{args.load_path}/resnet_distilled_from_clip_on_StanfordCars_best.pt'))
     num_of_params = sum([torch.numel(l) for l in student_model.parameters()])
     logging.info(f'Loaded student model num_of_params {num_of_params}')
@@ -71,14 +74,6 @@ def evaluate(loader: DataLoader, model: torch.nn.Module, device: torch.device) -
     return eval_accuracy * 100.0
 
 
-def save_model(args, model, suff):
-    save_path = Path(args.save_path)
-    if not save_path.exists():
-        save_path.mkdir()
-    file_path = Path(args.save_path) / f'resnet_distilled_from_clip_on_{args.data_name}_{time.asctime()}_{suff}.pt'
-    torch.save(model.state_dict(), file_path.as_posix())
-
-
 def get_vision_language_alignment_loss(args, teacher_vision_output, teacher_language_output, student_output):
     # Calculate outputs norm
     student_outputs_norm = nn.functional.normalize(student_output, dim=-1)
@@ -100,9 +95,30 @@ def get_vision_language_alignment_loss(args, teacher_vision_output, teacher_lang
 
     soft_teacher_values = F.softmax(teacher_for_align_topk_values, dim=-1)
     log_soft_teacher_values = F.log_softmax(teacher_for_align_topk_values, dim=-1)
-    soft_student_values = F.softmax(student_for_align_topk_values, dim=-1)
+    log_soft_student_values = F.log_softmax(student_for_align_topk_values, dim=-1)
 
-    return 1.0 * (soft_teacher_values * log_soft_teacher_values - soft_student_values).sum(dim=-1).mean()
+    alignment_loss = 1.0 * (soft_teacher_values * log_soft_teacher_values - log_soft_student_values).sum(dim=-1).mean()
+
+    return alignment_loss
+
+def get_data(args) -> tuple[Dataset, Dataset, Dataset, list[str]]:
+    # train_set = CIFAR10(root, train=True, download=True)
+    train_set = torchvision.datasets.ImageFolder(root=f'{args.data_path}/train')
+    train_set, validation_set = train_val_split(train_set)
+    # test_set = CIFAR10(root, train=False, download=True)
+    test_set = torchvision.datasets.ImageFolder(root=f'{args.data_path}/test')
+    # classes = ['airplane', 'automobile', 'bird', 'cat', 'deer', 'dog', 'frog', 'horse', 'ship', 'truck']
+    with open(f'{args.data_path}/names.csv', 'r') as f:
+        reader = csv.reader(f)
+        classes = [row[0] for row in reader]
+    logging.info(f'Classes {classes}')
+    return train_set, validation_set, test_set, classes
+
+
+def loss_fn_kd(outputs, teacher_outputs, T):
+    KD_loss = nn.KLDivLoss()(F.log_softmax(outputs / T, dim=1), F.softmax(teacher_outputs / T, dim=1)) * (T * T)
+
+    return KD_loss
 
 
 def distill(args):
@@ -138,7 +154,8 @@ def distill(args):
     num_epochs = args.num_epochs
     T = args.temperature
     soft_target_loss_weight = args.distillation_loss_weight
-    ce_loss_weight = 1.0 - soft_target_loss_weight
+    alignment_loss_weight = args.alignment_loss_weight
+    ce_loss_weight = 1.0 - soft_target_loss_weight - alignment_loss_weight
     teacher.eval()
 
     for epoch in range(num_epochs):
@@ -156,26 +173,34 @@ def distill(args):
             benchmark_optimizer.zero_grad()
             # Get teacher model (CLIP) output
             with torch.no_grad():
-                teacher_logits = teacher.encode_image(images)
-                # teacher_text_logits = teacher.encode_text(titles.squeeze())
+                teacher_logits = teacher.encode_image(images).float()
+                # teacher_text_logits = teacher.encode_text(titles.squeeze()).float()
 
             # Forward pass with the student model
             student_logits = student(images)
 
-            # Soften the student logits by applying softmax first and log() second
-            soft_targets = F.softmax(teacher_logits / T, dim=-1)
-            soft_prob = F.log_softmax(student_logits / T, dim=-1)
+            # alignment_loss = get_vision_language_alignment_loss(args, teacher_logits, teacher_text_logits,
+            #                                                     student_logits)
+            #
+            # # Soften the student logits by applying softmax first and log() second
+            # soft_targets = F.softmax(teacher_logits / T, dim=-1)
+            # soft_prob = F.log_softmax(student_logits / T, dim=-1)
+            #
+            # # Calculate the soft targets loss. Scaled by T**2 as suggested by the authors of the paper "Distilling
+            # # the knowledge in a neural network"
+            # soft_targets_loss = torch.sum(soft_targets * (soft_targets.log() - soft_prob)) / (
+            #             soft_prob.size()[0] * (T ** 2))
 
-            # Calculate the soft targets loss. Scaled by T**2 as suggested by the authors of the paper "Distilling
-            # the knowledge in a neural network"
-            soft_targets_loss = torch.sum(soft_targets * (soft_targets.log() - soft_prob)) / soft_prob.size()[0] * (
-                    T ** 2)
+            soft_targets_loss = loss_fn_kd(student_logits, teacher_logits, T)
 
             # Calculate the true label loss
             label_loss = criterion(student_logits, labels)
 
             # Weighted sum of the two losses
-            loss = soft_target_loss_weight * soft_targets_loss + ce_loss_weight * label_loss
+            loss = (
+                    soft_target_loss_weight * soft_targets_loss + ce_loss_weight * label_loss
+                # + alignment_loss_weight * alignment_loss
+            )
 
             benchmark_outputs = benchmark(images)
             benchmark_loss = benchmark_criterion(benchmark_outputs, labels)
@@ -189,7 +214,11 @@ def distill(args):
 
             running_loss += loss.item()
 
-            pbar.set_postfix({"running_loss": running_loss / float(batch_size)})
+            pbar.set_postfix({"running_loss": running_loss / float(batch_size),
+                              "soft_targets_loss": soft_targets_loss.item() / float(batch_size),
+                              'label_loss': label_loss.item() / float(batch_size)
+                              #, 'alignment_loss': alignment_loss.item() / float(batch_size)}
+                              })
         if (epoch + 1) % args.eval_every == 0:
             # Evaluate again after a single epoch on standard data
             val_acc_standard = evaluate(validation_loader, student, device)
@@ -206,8 +235,10 @@ def distill(args):
             benchmark_accuracy_list_on_ood.append(benchmark_val_acc_ood)
             logging.info(f'             Benchmark Validation accuracy OOD {benchmark_val_acc_ood}')
 
-            save_model(args, student, f'distilled_val_acc_standard_{val_acc_standard:.3f}_val_acc_ood_{val_acc_ood:.3f}')
-            save_model(args, benchmark, f'benchmark_val_acc_standard_{benchmark_val_acc_standard:.3f}_val_acc_ood_{benchmark_val_acc_ood:.3f}')
+            save_model(args, student,
+                       f'aligned_distilled_val_acc_standard_{val_acc_standard:.3f}_val_acc_ood_{val_acc_ood:.3f}')
+            save_model(args, benchmark,
+                       f'benchmark_val_acc_standard_{benchmark_val_acc_standard:.3f}_val_acc_ood_{benchmark_val_acc_ood:.3f}')
 
         print(f"Epoch [{epoch + 1}/{num_epochs}], Loss: {running_loss / len(train_loader):.4f}")
 
@@ -258,9 +289,10 @@ if __name__ == '__main__':
     parser.add_argument("--eval-every", type=int, default=10)
 
     parser.add_argument("--temperature", type=float, default=2.0, help="Distillation loss temperature")
-    parser.add_argument("--distillation-loss-weight", type=float, default=0.02, help="Distillation loss weight")
+    parser.add_argument("--distillation-loss-weight", type=float, default=0.5, help="Distillation loss weight")
+    parser.add_argument("--alignment-loss-weight", type=float, default=0.0, help="alignment loss weight")
 
-    parser.add_argument('--clip-align-proximal-text-num', type=int, default=256,
+    parser.add_argument('--clip-align-proximal-text-num', type=int, default=32,
                         help="If >0, specifies the k in L-vlalign")
 
     args = parser.parse_args()
