@@ -4,13 +4,14 @@ import gc
 import logging
 from pathlib import Path
 
-import numpy as np
+
 import torch
 import torchvision.ops
 from torch import nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
-import os
+
 
 from PIL import Image
 from torchvision.transforms import v2
@@ -19,6 +20,8 @@ from tqdm import tqdm
 from distillation import save_model
 from utils import set_logger, set_seed, get_device, get_resnet, get_data
 
+
+IMAGE_SIZE = 224
 
 class Backbone(nn.Module):
     def __init__(self, resnet: nn.Module):
@@ -41,7 +44,7 @@ class DetectionHead(nn.Module):
         x = self.conv(x)
         x = self.relu(x)
         cls_logits = self.cls_head(x)
-        bbox_preds = self.reg_head(x)
+        bbox_preds = F.relu(self.reg_head(x))
         return cls_logits, bbox_preds
 
 
@@ -68,8 +71,8 @@ class ImageTitleDetectionDatasetWrapper(Dataset):
         self._img_dir = img_dir
 
         self._transform = v2.Compose([
-            v2.Resize(224),  # Resize the shorter side to 224 pixels
-            v2.CenterCrop(224),  # Crop the center to 224x224
+            v2.Resize(IMAGE_SIZE),  # Resize the shorter side to 224 pixels
+            v2.CenterCrop(IMAGE_SIZE),  # Crop the center to 224x224
             v2.ToTensor(),  # Convert the image to a PyTorch tensor
             v2.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],  # Normalize the image
                          std=[0.26862954, 0.26130258, 0.27577711])
@@ -111,41 +114,19 @@ class ImageTitleDetectionDatasetWrapper(Dataset):
             # Detection (re-using imports and transforms from above)
             from torchvision import tv_tensors
 
-            boxes = tv_tensors.BoundingBoxes([bbox], format="XYXY", canvas_size=(224, 224))
+            boxes = tv_tensors.BoundingBoxes([bbox], format="XYXY", canvas_size=(IMAGE_SIZE, IMAGE_SIZE))
             image, bbox = self._transform(image, boxes)
+            bbox = bbox / float(IMAGE_SIZE)
 
 
         return image, torch.tensor(label), bbox
-
-
-@torch.no_grad()
-def calculate_iou(box1, box2) -> float:
-    """
-    Calculate Intersection over Union (IoU) between two bounding boxes.
-    Each box is represented as [x1, y1, x2, y2].
-    """
-    x1, y1, x2, y2 = box1
-    x1g, y1g, x2g, y2g = box2
-
-    xi1 = max(x1, x1g)
-    yi1 = max(y1, y1g)
-    xi2 = min(x2, x2g)
-    yi2 = min(y2, y2g)
-    inter_area = max(0, xi2 - xi1 + 1) * max(0, yi2 - yi1 + 1)
-
-    box1_area = (x2 - x1 + 1) * (y2 - y1 + 1)
-    box2_area = (x2g - x1g + 1) * (y2g - y1g + 1)
-
-    iou = inter_area / float(box1_area + box2_area - inter_area)
-    return iou
-
 
 @torch.no_grad()
 def evaluate(loader: DataLoader, model: torch.nn.Module, device: torch.device) -> tuple[float, float]:
     model.eval()
     total_correct = 0
     total_images = 0
-    iou_scores_list = []
+    sum_iou = 0.0
 
     with torch.no_grad():
         for batch in loader:
@@ -157,19 +138,18 @@ def evaluate(loader: DataLoader, model: torch.nn.Module, device: torch.device) -
             cls_logits, bbox_preds = model(images)
             _, predicted_labels = torch.max(cls_logits, 1)
 
-            total_correct += (predicted_labels == true_labels).sum().item()
-            total_images += true_labels.size(0)
+            total_correct += (predicted_labels.squeeze() == true_labels).sum().item()
+            total_images += true_labels.shape[0]
             true_bboxes = true_bboxes.reshape(true_bboxes.shape[0], 4, -1)
             bbox_preds = bbox_preds.reshape(true_bboxes.shape)
-            iou_scores_t = torchvision.ops.box_iou(bbox_preds, true_bboxes)
-            iou_scores_list.append(iou_scores_t)
+            sum_iou += float(torchvision.ops.box_iou(bbox_preds, true_bboxes).squeeze().trace())
 
-    accuracy = 100.0 * total_correct / total_images
-    avg_iou: float = torch.cat(iou_scores_list).mean().item()
+    accuracy = 100.0 * total_correct / float(total_images)
+    avg_iou: float = 100.0 * sum_iou / float(total_images)
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     gc.collect()
-    print(f"Evaluation - Accuracy: {accuracy:.4f}, Avg IoU: {avg_iou:.4f}")
+    print(f"Evaluation - Accuracy: {accuracy:.4f}, Avg IoU: {avg_iou:.4f} total images: {total_images}")
     return accuracy, avg_iou
 
 
@@ -363,7 +343,7 @@ if __name__ == '__main__':
                         help="resnet18 or resnet50")
 
     parser.add_argument("--use-cuda", type=bool, default=True, help="use cuda or cpu")
-    parser.add_argument("--eval-every", type=int, default=5)
+    parser.add_argument("--eval-every", type=int, default=1)
 
     args = parser.parse_args()
 
