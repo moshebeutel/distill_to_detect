@@ -264,7 +264,7 @@ if __name__ == '__main__':
     ##################################
 
     parser.add_argument("--teacher", type=str, default=model_name)
-    parser.add_argument("--student", type=str, default='resnet50')
+    parser.add_argument("--student", type=str, default='resnet18')
     # parser.add_argument("--num-blocks", type=int, default=3)
     # parser.add_argument("--block-size", type=int, default=3)
 
@@ -282,7 +282,7 @@ if __name__ == '__main__':
                         help="dir path for checkpoints")
     parser.add_argument("--load-path", type=str, default=(Path.home() / f'saved_models' / 'clip').as_posix(),
                         help="dir path for checkpoints")
-    parser.add_argument("--resnet-ver", type=str, default='resnet50', choices=['resnet18', 'resnet50'],
+    parser.add_argument("--resnet-ver", type=str, default='resnet18', choices=['resnet18', 'resnet50'],
                         help="resnet18 or resnet50")
 
     parser.add_argument("--use-cuda", type=bool, default=True, help="use cuda or cpu")

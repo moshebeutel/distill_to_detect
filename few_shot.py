@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from torchvision.transforms import v2
 from tqdm import tqdm
-from utils import set_logger, set_seed, get_data, get_device, get_resnet, save_model
+from utils import set_logger, set_seed, get_data, get_device, get_resnet, save_model, initialize_weights
 
 IMAGE_SIZE = 224
 
@@ -127,6 +127,7 @@ class ClassificationHead(nn.Module):
         self.relu = nn.ReLU(inplace=True)
         self.cls_head = nn.Conv2d(512, num_classes, kernel_size=1)
 
+
     def forward(self, x):
         x = self.conv(x)
         x = self.relu(x)
@@ -138,8 +139,9 @@ class ClassificationHead(nn.Module):
 class ClassificationModel(nn.Module):
     def __init__(self, backbone, classification_head, freeze_backbone=True, use_softmax=True):
         super(ClassificationModel, self).__init__()
-        self.backbone = backbone
-        self.classification_head = classification_head
+        self._backbone = backbone
+        self._classification_head = classification_head
+        initialize_weights(self._classification_head)
         self._freeze_backbone = freeze_backbone
         self._use_softmax = use_softmax
 
@@ -158,11 +160,11 @@ class ClassificationModel(nn.Module):
     def forward(self, x):
         if self.freeze_backbone:
             with torch.no_grad():
-                features = self.backbone(x)
+                features = self._backbone(x)
         else:
-            features = self.backbone(x)
+            features = self._backbone(x)
 
-        cls_logits = self.classification_head(features)
+        cls_logits = self._classification_head(features)
 
         out = F.softmax(cls_logits, dim=1) if self._use_softmax else cls_logits
 
@@ -170,9 +172,9 @@ class ClassificationModel(nn.Module):
 
 
 class ImageDatasetWrapper(Dataset):
-    def __init__(self, dataset: Dataset, ood=False):
+    def __init__(self, dataset: Dataset, ood=False, severity=5):
         # Initialize image paths and corresponding texts
-        self._dataset = dataset
+        self._dataset: Dataset = dataset
 
         self._transform = v2.Compose([
             v2.ToPILImage(),
@@ -183,10 +185,17 @@ class ImageDatasetWrapper(Dataset):
                          std=[0.26862954, 0.26130258, 0.27577711])
         ])
 
+        noise_scale = [0.04, 0.06, .08, .09, .10][severity - 1]
+        self._ood_transform = v2.Compose([v2.ToImage(),
+                                          v2.ToDtype(torch.float32, scale=True),
+                                          v2.GaussianNoise(sigma=noise_scale, clip=True),
+                                          v2.ToDtype(torch.uint8, scale=True),
+                                          v2.ToPILImage()])
+
         self._ood_transform = transforms.Compose([transforms.ToTensor(),
                                                   transforms.ColorJitter(contrast=0.5, brightness=1.0)])
 
-        self._ood = ood
+        self._ood: bool = ood
 
     def __len__(self):
         return len(self._dataset)
@@ -216,9 +225,9 @@ def few_shot(args):
     benchmark_resnet.fc = nn.Linear(benchmark_resnet.fc.in_features, num_classes)
 
     distilled_resnet.load_state_dict(
-        torch.load(f'{args.load_path}/resnet_distilled_from_clip_on_StanfordCars_best_distilled.pt'))
+        torch.load(f'{args.load_path}/resnet_distilled_from_clip_on_StanfordCars_Tue Jul 30 02:11:19 2024_aligned_distilled_val_acc_standard_77.655_val_acc_ood_76.182.pt'))
     benchmark_resnet.load_state_dict(
-        torch.load(f'{args.load_path}/resnet_distilled_from_clip_on_StanfordCars_best_benchmark.pt'))
+        torch.load(f'{args.load_path}/resnet_distilled_from_clip_on_StanfordCars_Tue Jul 30 02:11:19 2024_benchmark_val_acc_standard_77.103_val_acc_ood_74.708.pt'))
 
     distilled_backbone = Backbone(distilled_resnet)
     benchmark_backbone = Backbone(benchmark_resnet)
@@ -230,11 +239,11 @@ def few_shot(args):
     benchmark_classifier.to(device)
 
     train_set_original = ImageDatasetWrapper(train_set, ood=False)
-    train_loader = DataLoader(train_set_original, batch_size=64, shuffle=True)
     train_set_ood = ImageDatasetWrapper(train_set, ood=True)
+    train_loader = DataLoader(train_set_original, batch_size=64, shuffle=True)
+    train_loader_ood = DataLoader(train_set_ood, batch_size=64, shuffle=True)
     validation_set_original = ImageDatasetWrapper(validation_set)
     validation_set_ood = ImageDatasetWrapper(validation_set, ood=True)
-    train_loader_ood = DataLoader(train_set_ood, batch_size=64, shuffle=True)
     validation_loader = DataLoader(validation_set_original, batch_size=512, shuffle=False)
     validation_loader_ood = DataLoader(validation_set_ood, batch_size=512, shuffle=False)
 
@@ -255,11 +264,12 @@ def few_shot(args):
 
     benchmark_accuracy_list_on_original, benchmark_accuracy_list_on_ood = [val_acc_baseline], [val_acc_ood_baseline]
 
+    # train classification head on in distribution datasets
     criterion = nn.CrossEntropyLoss()
     distilled_optimizer = torch.optim.Adam(distilled_classifier.classification_head.parameters(), lr=args.lr)
     benchmark_optimizer = torch.optim.Adam(benchmark_classifier.classification_head.parameters(), lr=args.lr)
     num_epochs = args.num_epochs_train_head
-    # train classification head on in distribution datasets
+
     for epoch in range(num_epochs):
         running_loss = 0.0
         benchmark_running_loss = 0.0

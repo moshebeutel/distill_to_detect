@@ -3,20 +3,15 @@ import csv
 import gc
 import logging
 from pathlib import Path
-
-
 import torch
 import torchvision.ops
 from torch import nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
-
-
 from PIL import Image
 from torchvision.transforms import v2
 from tqdm import tqdm
-
 from utils import set_logger, set_seed, get_device, get_resnet, get_data, save_model
 
 IMAGE_SIZE = 224
@@ -65,7 +60,7 @@ class DetectionModel(nn.Module):
 
 
 class ImageTitleDetectionDatasetWrapper(Dataset):
-    def __init__(self, annotations_file, img_dir, ood=False):
+    def __init__(self, annotations_file, img_dir, ood=False, severity=5):
         self._img_dir = img_dir
 
         self._transform = v2.Compose([
@@ -75,9 +70,16 @@ class ImageTitleDetectionDatasetWrapper(Dataset):
             v2.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],  # Normalize the image
                          std=[0.26862954, 0.26130258, 0.27577711])
         ])
-        self._ood_transform = transforms.Compose([transforms.ToTensor(),
-                                                  transforms.ColorJitter(contrast=0.5, brightness=1.0),
-                                                  transforms.ToPILImage()])
+        # self._ood_transform = transforms.Compose([transforms.ToTensor(),
+        #                                           transforms.ColorJitter(contrast=0.5, brightness=1.0),
+        #                                           transforms.ToPILImage()])
+
+        noise_scale = [0.04, 0.06, .08, .09, .10][severity - 1]
+        self._ood_transform = v2.Compose([v2.ToImage(),
+                                          v2.ToDtype(torch.float32, scale=True),
+                                          v2.GaussianNoise(sigma=noise_scale, clip=True),
+                                          v2.ToDtype(torch.uint8, scale=True),
+                                          v2.ToPILImage()])
 
         with open(annotations_file, 'r') as f:
             reader = csv.reader(f)
@@ -164,9 +166,11 @@ def detect(args):
     benchmark_resnet.fc = nn.Linear(benchmark_resnet.fc.in_features, num_classes)
 
     distilled_resnet.load_state_dict(
-        torch.load(f'{args.load_path}/resnet_distilled_from_clip_on_StanfordCars_best_distilled.pt'))
+        torch.load(
+            f'{args.load_path}/resnet_distilled_from_clip_on_StanfordCars_Tue Jul 30 02:11:19 2024_aligned_distilled_val_acc_standard_77.655_val_acc_ood_76.182.pt'))
     benchmark_resnet.load_state_dict(
-        torch.load(f'{args.load_path}/resnet_distilled_from_clip_on_StanfordCars_best_benchmark.pt'))
+        torch.load(
+            f'{args.load_path}/resnet_distilled_from_clip_on_StanfordCars_Tue Jul 30 02:11:19 2024_benchmark_val_acc_standard_77.103_val_acc_ood_74.708.pt'))
 
     distilled_backbone = Backbone(distilled_resnet)
     benchmark_backbone = Backbone(benchmark_resnet)
@@ -341,7 +345,7 @@ if __name__ == '__main__':
                         help="resnet18 or resnet50")
 
     parser.add_argument("--use-cuda", type=bool, default=True, help="use cuda or cpu")
-    parser.add_argument("--eval-every", type=int, default=1)
+    parser.add_argument("--eval-every", type=int, default=5)
 
     args = parser.parse_args()
 

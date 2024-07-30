@@ -3,15 +3,27 @@ import logging
 import random
 import time
 from pathlib import Path
-
 import clip
 import numpy as np
 import torch
 import torchvision.datasets
+from torch import nn
 from torch.utils.data import Dataset
-from torchvision import transforms
 from torchvision.models import resnet18, resnet50
 from torchvision.transforms import v2
+
+
+def initialize_weights(module: nn.Module):
+    for m in module.modules():
+
+        if isinstance(m, nn.Conv2d):
+            nn.init.kaiming_normal_(m.weight)
+            if m.bias is not None:
+                m.bias.data.zero_()
+        elif isinstance(m, nn.Linear):
+            nn.init.kaiming_normal_(m.weight)
+            m.bias.data.zero_()
+
 
 
 def set_seed(seed, cudnn_enabled=True):
@@ -65,7 +77,7 @@ def get_data(args) -> tuple[Dataset, Dataset, Dataset, list[str]]:
 
 
 def train_val_split(train_set: Dataset, split_ratio: float = 0.8, shuffle: bool = True) -> tuple[Dataset, Dataset]:
-    from torch.utils.data import DataLoader, Subset
+    from torch.utils.data import Subset
     dataset_size = len(train_set)
     split_index = int(dataset_size * split_ratio)
     indices = list(range(dataset_size))
@@ -78,7 +90,7 @@ def train_val_split(train_set: Dataset, split_ratio: float = 0.8, shuffle: bool 
 
 
 class ImageTitleDatasetWrapper(Dataset):
-    def __init__(self, dataset: Dataset, list_txt: list[str], preprocess, ood=False, severity=1):
+    def __init__(self, dataset: Dataset, list_txt: list[str], preprocess, ood=False, severity=5):
         # Initialize image paths and corresponding texts
         self._dataset = dataset
 
@@ -108,7 +120,7 @@ class ImageTitleDatasetWrapper(Dataset):
 
 def get_resnet(args):
     logging.info(f'Loading resnet model {args.resnet_ver}')
-    renet_ctor = resnet18 if args.resnet_ver == resnet18 else resnet50
+    renet_ctor = resnet18 if args.resnet_ver == "resnet18" else resnet50
     model = renet_ctor(weights='DEFAULT')
     return model
 
